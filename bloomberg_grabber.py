@@ -50,15 +50,126 @@ NS = {
     "image": "http://www.google.com/schemas/sitemap-image/1.1",
 }
 DEFAULT_TO = "1188540@qq.com"
+BLOOMBERG_HOME = "https://www.bloomberg.com"
 LIGHTPANDA_TIMEOUT = 25  # seconds for lightpanda fetch
+# 首页模块优先级：lede 是头版头条，well-* 是次级头条区
+HOME_MODULE_ORDER = ["lede", "well-1", "well-2", "well-3", "well-4", "more-top-stories", "latest"]
 CHROME_TIMEOUT = 50  # seconds total for AppleScript
 
 
 # ─────────────────────────────────────────────
 # 1. Fetch headline list from sitemap
 # ─────────────────────────────────────────────
-def fetch_headlines(count: int = 10) -> list[dict]:
-    """从 Bloomberg sitemap 获取最新头条新闻列表。"""
+def fetch_headlines(count: int = 10, source: str = "homepage") -> list[dict]:
+    """
+    获取 Bloomberg 头条新闻列表。
+
+    source="homepage"（默认）：从 Bloomberg 首页 __NEXT_DATA__ 提取编辑精选头条。
+    source="sitemap"：从 sitemap XML 获取最新发布的文章（按时间排序）。
+    """
+    if source == "homepage":
+        try:
+            return _fetch_headlines_from_homepage(count)
+        except Exception as e:
+            print(f"  ⚠️  首页提取失败 ({e})，fallback 到 sitemap")
+            return _fetch_headlines_from_sitemap(count)
+    return _fetch_headlines_from_sitemap(count)
+
+
+def _fetch_headlines_from_homepage(count: int) -> list[dict]:
+    """从 Bloomberg 首页 __NEXT_DATA__ 提取编辑精选头条。"""
+    if not _lightpanda_available():
+        raise RuntimeError("lightpanda 不可用")
+
+    wait_expr = (
+        "document.getElementById('__NEXT_DATA__') && "
+        "document.getElementById('__NEXT_DATA__').textContent.length > 100000"
+    )
+
+    result = subprocess.run(
+        [
+            "lightpanda", "fetch", BLOOMBERG_HOME,
+            "--dump", "html",
+            "--wait-ms", str(LIGHTPANDA_TIMEOUT * 1000),
+            "--wait-script", wait_expr,
+            "--json",
+            "--log-level", "error",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=LIGHTPANDA_TIMEOUT + 10,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"lightpanda exit {result.returncode}")
+
+    # 解析 JSON 输出
+    html_content = ""
+    for line in result.stdout.split("\n"):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+            if "content" in obj:
+                html_content = obj["content"]
+                break
+        except json.JSONDecodeError:
+            continue
+
+    if not html_content:
+        raise RuntimeError("no HTML content in output")
+
+    # 提取 __NEXT_DATA__
+    idx = html_content.find("__NEXT_DATA__")
+    if idx < 0:
+        raise RuntimeError("no __NEXT_DATA__ on homepage")
+
+    start = html_content.find(">", idx) + 1
+    end = html_content.find("</script>", start)
+    nd = json.loads(html_content[start:end].strip())
+
+    modules = nd.get("props", {}).get("pageProps", {}).get("initialState", {}).get("modulesById", {})
+
+    seen_urls = set()
+    articles = []
+
+    for module_id in HOME_MODULE_ORDER:
+        mod = modules.get(module_id, {})
+        items = mod.get("items", [])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url", "")
+            if not url:
+                continue
+
+            full_url = f"https://www.bloomberg.com{url}" if url.startswith("/") else url
+            clean_url = full_url.split("?")[0]
+            if clean_url in seen_urls:
+                continue
+            seen_urls.add(clean_url)
+
+            img = item.get("image", {})
+            image_url = img.get("baseUrl", "") if isinstance(img, dict) else ""
+
+            articles.append({
+                "title": item.get("headline", ""),
+                "url": full_url,
+                "published": item.get("publishedAt", ""),
+                "image": image_url,
+            })
+
+            if len(articles) >= count:
+                break
+        if len(articles) >= count:
+            break
+
+    return articles
+
+
+def _fetch_headlines_from_sitemap(count: int) -> list[dict]:
+    """从 Bloomberg sitemap 获取最新文章列表（按发布时间排序）。"""
     for attempt in range(3):
         try:
             resp = requests.get(SITEMAP_URL, timeout=30)
@@ -631,6 +742,8 @@ def main():
     parser.add_argument("--smtp-pass", default=os.getenv("BLOOMBERG_SMTP_PASS", ""))
     parser.add_argument("--output", "-o", help="保存 HTML 到文件")
     parser.add_argument("--skip-extract", action="store_true", help="只获取标题列表，不提取正文")
+    parser.add_argument("--source", choices=["homepage", "sitemap"], default="homepage",
+                        help="头条来源: homepage=首页编辑精选(默认), sitemap=最新发布")
     parser.add_argument("--backend", choices=["auto", "lightpanda", "chrome"], default="auto",
                         help="正文提取后端 (默认: auto，优先 lightpanda)")
     args = parser.parse_args()
@@ -643,11 +756,11 @@ def main():
         articles = [{"title": "", "url": args.url, "published": "", "image": ""}]
         print(f"\n📌 指定文章: {args.url}")
     else:
-        print(f"\n🔍 从 sitemap 获取最新 {args.count} 条头条...")
+        print(f"\n🔍 获取最新 {args.count} 条头条 (source={args.source})...")
         try:
-            articles = fetch_headlines(args.count)
+            articles = fetch_headlines(args.count, source=args.source)
         except Exception as e:
-            print(f"❌ 获取 sitemap 失败: {e}", file=sys.stderr)
+            print(f"❌ 获取头条失败: {e}", file=sys.stderr)
             sys.exit(1)
 
         if not articles:

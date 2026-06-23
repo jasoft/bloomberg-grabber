@@ -474,8 +474,81 @@ def extract_article(url: str, backend: str = "auto") -> Optional[dict]:
     return extract_via_chrome(url)
 
 
+
 # ─────────────────────────────────────────────
-# 3. Render body nodes → HTML
+# 3a. Translation via Google Translate (free)
+# ─────────────────────────────────────────────
+_TRANSLATE_CACHE: dict[str, str] = {}
+
+
+def translate_text(text: str, src: str = "en", tgt: str = "zh-CN") -> str:
+    """翻译文本。使用 Google Translate 免费端点，带缓存。"""
+    if not text or not text.strip():
+        return text
+    cache_key = f"{src}:{tgt}:{text}"
+    if cache_key in _TRANSLATE_CACHE:
+        return _TRANSLATE_CACHE[cache_key]
+    try:
+        resp = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = "".join(seg[0] for seg in data[0])
+        _TRANSLATE_CACHE[cache_key] = result
+        return result
+    except Exception as e:
+        print(f"    ⚠️  翻译失败: {e}", file=sys.stderr)
+        return text
+
+
+def _fix_image_url(url: str) -> str:
+    """修复图片 URL：webp → jpg，移除动态图表 URL。"""
+    if not url:
+        return url
+    # Bloomberg 的 webp 图片在邮件客户端不显示，换成 jpg
+    # /v0/-1x-1.webp → /v0/1200x-1.jpg
+    if url.endswith(".webp"):
+        url = re.sub(r"/[^/]+.webp$", "/1200x-1.jpg", url)
+    # toaster/v2/charts 是动态图表，邮件里无法渲染，返回空
+    if "toaster/v2/charts" in url:
+        return ""
+    return url
+
+
+def translate_article(article: dict) -> dict:
+    """翻译文章标题、作者、AI 摘要和正文中的文本节点。"""
+    if article.get("title"):
+        article["title"] = translate_text(article["title"])
+    if article.get("ai_summary"):
+        article["ai_summary"] = translate_text(article["ai_summary"])
+    # 翻译正文节点（递归）
+    if article.get("body_nodes"):
+        article["body_nodes"] = [_translate_node(n) for n in article["body_nodes"]]
+    # 修复图片
+    if article.get("image"):
+        article["image"] = _fix_image_url(article["image"])
+    return article
+
+
+def _translate_node(n: dict) -> dict:
+    """递归翻译文本节点。"""
+    if not n:
+        return n
+    t = n.get("type", "")
+    if t == "text":
+        value = n.get("value", "")
+        if value.strip():
+            n["value"] = translate_text(value)
+        return n
+    if n.get("content"):
+        n["content"] = [_translate_node(c) for c in n["content"]]
+    return n
+
+# ─────────────────────────────────────────────
+# 3b. Render body nodes → HTML
 # ─────────────────────────────────────────────
 def esc(s: str) -> str:
     return html_module.escape(s or "")
@@ -550,7 +623,9 @@ def render_node(n: dict) -> str:
         c_foot = att.get("footnote", "")
         c_src = att.get("source", "")
         h = [f'<div style="margin:1.2em 0;padding:12px;background:#f8f9fa;border-radius:4px">']
-        h.append(f'<img src="{esc(src)}" style="max-width:100%;height:auto">')
+        fixed_src = _fix_image_url(src)
+        if fixed_src:
+            h.append(f'<img src="{esc(fixed_src)}" style="max-width:100%;height:auto">')
         if c_title:
             h.append(f'<p style="font-size:13px;font-weight:bold;margin:8px 0 0">{esc(c_title)}</p>')
         if c_foot:
@@ -588,7 +663,7 @@ def render_article_html(article: dict, index: int) -> str:
         pub_str = ""
 
     h = []
-    h.append(f'<div style="margin-bottom:32px">')
+    h.append(f'<div id="article-{index}" style="margin-bottom:32px">')
 
     if image:
         h.append(f'<img src="{esc(image)}" style="width:100%;max-height:400px;object-fit:cover;border-radius:4px;margin-bottom:12px">')
@@ -636,6 +711,16 @@ def build_email_html(articles: list[dict]) -> str:
         f'<p style="font-size:12px;color:#999;margin:4px 0 0">{now_str} · {len(articles)} articles</p>',
         f'</div>',
     ]
+
+    # 目录导航
+    parts.append('<div style="margin-bottom:24px;padding:16px;background:#f0f4f8;border-radius:6px">')
+    parts.append('<p style="font-size:15px;font-weight:bold;margin:0 0 10px">📋 目录</p>')
+    for ti, ta in enumerate(articles):
+        t_title = ta.get('title', f'Article {ti+1}')
+        parts.append(f'<p style="margin:4px 0;font-size:14px;line-height:1.6">'
+                     f'<a href="#article-{ti+1}" style="color:#0969da;text-decoration:none">'
+                     f'{ti+1}. {esc(t_title)}</a></p>')
+    parts.append('</div>')
 
     for i, article in enumerate(articles):
         if i > 0:
@@ -821,9 +906,16 @@ def main():
             a.setdefault("byline", "")
             a.setdefault("ai_summary", "")
 
+    # Step 2.5: 翻译 + 修复图片
+    if not args.skip_extract:
+        print(f"\n🌐 翻译为中文 + 修复图片...")
+        for i, article in enumerate(articles):
+            translate_article(article)
+            print(f"  [{i+1}/{len(articles)}] {article.get('title', '')[:50]}")
+
     # Step 3: 生成邮件
     now = datetime.now()
-    subject = f"📰 Bloomberg Headlines — {now.strftime('%Y-%m-%d')}"
+    subject = f"📰 Bloomberg 头条 — {now.strftime('%Y-%m-%d')}"
     html_body = build_email_html(articles)
     plain_body = build_email_plain(articles)
 

@@ -68,11 +68,7 @@ def fetch_headlines(count: int = 10, source: str = "homepage") -> list[dict]:
     source="sitemap"：从 sitemap XML 获取最新发布的文章（按时间排序）。
     """
     if source == "homepage":
-        try:
-            return _fetch_headlines_from_homepage(count)
-        except Exception as e:
-            print(f"  ⚠️  首页提取失败 ({e})，fallback 到 sitemap")
-            return _fetch_headlines_from_sitemap(count)
+        return _fetch_headlines_from_homepage(count)
     return _fetch_headlines_from_sitemap(count)
 
 
@@ -485,11 +481,10 @@ def extract_article(url: str, backend: str = "auto") -> Optional[dict]:
     """统一提取接口：根据 backend 选择 lightpanda 或 chrome。"""
     if backend == "chrome":
         return extract_via_chrome(url)
-    # auto 或 lightpanda：优先 lightpanda，不可用时 fallback 到 chrome
-    if _lightpanda_available():
+    if backend == "lightpanda" or _lightpanda_available():
         return extract_via_lightpanda(url)
-    print("    ℹ️  Lightpanda 不可用，fallback 到 Chrome AppleScript")
-    return extract_via_chrome(url)
+    print("    ❌ Lightpanda 不可用且未指定 chrome 后端", file=sys.stderr)
+    return None
 
 
 
@@ -687,6 +682,8 @@ def render_article_html(article: dict, index: int) -> str:
     h = []
     h.append(f'<div id="article-{index}" style="margin-bottom:32px">')
 
+    if image:
+        image = _fix_image_url(image)
     if image:
         h.append(f'<img src="{esc(image)}" style="width:100%;max-height:400px;object-fit:cover;border-radius:4px;margin-bottom:12px">')
 

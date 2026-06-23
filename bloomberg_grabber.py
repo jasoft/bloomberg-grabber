@@ -6,7 +6,8 @@ Bloomberg Headline Grabber
 
 工作流：
   1. 从 Bloomberg sitemap XML 获取最新文章列表（无需认证）
-  2. 用 macOS Chrome AppleScript 提取 __NEXT_DATA__ 完整正文
+  2. 通过 Lightpanda headless 浏览器提取 __NEXT_DATA__ 完整正文（默认）
+     或通过 macOS Chrome AppleScript 提取（--backend chrome）
   3. 解析递归 JSON 文档树，渲染为 HTML
   4. 通过 SMTP 发送 HTML 邮件
 
@@ -27,6 +28,7 @@ import html as html_module
 import json
 import os
 import re
+import shutil
 import smtplib
 import ssl
 import subprocess
@@ -48,6 +50,7 @@ NS = {
     "image": "http://www.google.com/schemas/sitemap-image/1.1",
 }
 DEFAULT_TO = "1188540@qq.com"
+LIGHTPANDA_TIMEOUT = 25  # seconds for lightpanda fetch
 CHROME_TIMEOUT = 50  # seconds total for AppleScript
 
 
@@ -104,7 +107,115 @@ def fetch_headlines(count: int = 10) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# 2. Extract article via Chrome AppleScript
+# 2a. Extract article via Lightpanda
+# ─────────────────────────────────────────────
+def _lightpanda_available() -> bool:
+    """检查 lightpanda 命令是否可用。"""
+    return shutil.which("lightpanda") is not None
+
+
+def extract_via_lightpanda(url: str) -> Optional[dict]:
+    """
+    通过 Lightpanda headless 浏览器提取 Bloomberg 文章 __NEXT_DATA__。
+    Lightpanda 是用 Zig 写的轻量 headless 浏览器，比 Chrome 快 ~9x，内存低 ~16x。
+    """
+    # 等待 __NEXT_DATA__ 就绪的 JS 表达式
+    wait_expr = (
+        "document.getElementById('__NEXT_DATA__') && "
+        "document.getElementById('__NEXT_DATA__').textContent.length > 1000"
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                "lightpanda", "fetch", url,
+                "--dump", "html",
+                "--wait-ms", str(LIGHTPANDA_TIMEOUT * 1000),
+                "--wait-script", wait_expr,
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=LIGHTPANDA_TIMEOUT + 10,
+        )
+    except subprocess.TimeoutExpired:
+        print("    ⚠️  Lightpanda 超时", file=sys.stderr)
+        return None
+
+    if result.returncode != 0:
+        stderr_tail = result.stderr.strip()[-300:] if result.stderr else ""
+        print(f"    ⚠️  Lightpanda 错误 (exit {result.returncode}): {stderr_tail}", file=sys.stderr)
+        return None
+
+    # 解析 JSON 输出，找到包含 content 的对象
+    html_content = ""
+    for line in result.stdout.split("\n"):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+            if "content" in obj:
+                html_content = obj["content"]
+                break
+        except json.JSONDecodeError:
+            continue
+
+    if not html_content:
+        print("    ⚠️  Lightpanda 输出中未找到 HTML content", file=sys.stderr)
+        return None
+
+    return _parse_next_data(html_content)
+
+
+def _parse_next_data(html_content: str) -> Optional[dict]:
+    """从 HTML 中提取 __NEXT_DATA__ 并解析文章数据。"""
+    idx = html_content.find("__NEXT_DATA__")
+    if idx < 0:
+        print("    ⚠️  页面中未找到 __NEXT_DATA__", file=sys.stderr)
+        return None
+
+    start = html_content.find(">", idx) + 1
+    end = html_content.find("</script>", start)
+    if start <= 0 or end < 0:
+        print("    ⚠️  __NEXT_DATA__ script 标签解析失败", file=sys.stderr)
+        return None
+
+    try:
+        next_data = json.loads(html_content[start:end].strip())
+    except json.JSONDecodeError as e:
+        print(f"    ⚠️  __NEXT_DATA__ JSON 解析失败: {e}", file=sys.stderr)
+        return None
+
+    story = next_data.get("props", {}).get("pageProps", {}).get("story")
+    if not story:
+        print("    ⚠️  __NEXT_DATA__ 中未找到 story", file=sys.stderr)
+        return None
+
+    ai_summary = ""
+    ai = story.get("aiSummary")
+    if ai and isinstance(ai, dict) and ai.get("text"):
+        ai_summary = " ".join(ai["text"])
+
+    body = story.get("body", {})
+    if isinstance(body, list):
+        nodes = body
+    elif isinstance(body, dict):
+        nodes = body.get("content", [])
+    else:
+        nodes = []
+
+    return {
+        "title": story.get("headline", ""),
+        "byline": story.get("byline", ""),
+        "published": story.get("publishedAt", ""),
+        "ai_summary": ai_summary,
+        "body_nodes": nodes,
+    }
+
+
+# ─────────────────────────────────────────────
+# 2b. Extract article via Chrome AppleScript (fallback)
 # ─────────────────────────────────────────────
 def extract_via_chrome(url: str) -> Optional[dict]:
     """
@@ -236,6 +347,20 @@ end tell
         "ai_summary": meta.get("aiSummary", ""),
         "body_nodes": nodes,
     }
+
+
+# ─────────────────────────────────────────────
+# 2c. Unified extract dispatcher
+# ─────────────────────────────────────────────
+def extract_article(url: str, backend: str = "auto") -> Optional[dict]:
+    """统一提取接口：根据 backend 选择 lightpanda 或 chrome。"""
+    if backend == "chrome":
+        return extract_via_chrome(url)
+    # auto 或 lightpanda：优先 lightpanda，不可用时 fallback 到 chrome
+    if _lightpanda_available():
+        return extract_via_lightpanda(url)
+    print("    ℹ️  Lightpanda 不可用，fallback 到 Chrome AppleScript")
+    return extract_via_chrome(url)
 
 
 # ─────────────────────────────────────────────
@@ -506,6 +631,8 @@ def main():
     parser.add_argument("--smtp-pass", default=os.getenv("BLOOMBERG_SMTP_PASS", ""))
     parser.add_argument("--output", "-o", help="保存 HTML 到文件")
     parser.add_argument("--skip-extract", action="store_true", help="只获取标题列表，不提取正文")
+    parser.add_argument("--backend", choices=["auto", "lightpanda", "chrome"], default="auto",
+                        help="正文提取后端 (默认: auto，优先 lightpanda)")
     args = parser.parse_args()
 
     print("📰 Bloomberg Headline Grabber")
@@ -533,21 +660,30 @@ def main():
 
     # Step 2: 提取正文
     if not args.skip_extract:
-        # 确保 Chrome 在运行
-        chrome_check = subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to (name of processes) contains "Google Chrome"'],
-            capture_output=True, text=True, timeout=5,
-        )
-        if "true" not in chrome_check.stdout.lower():
-            print("\n🚀 启动 Google Chrome...")
-            subprocess.run(["open", "-a", "Google Chrome"], timeout=10)
-            time.sleep(3)
+        # 确定实际使用的后端
+        actual_backend = args.backend
+        if actual_backend == "auto":
+            if _lightpanda_available():
+                actual_backend = "lightpanda"
+            else:
+                actual_backend = "chrome"
+        print(f"\n📖 通过 {actual_backend.upper()} 提取 {len(articles)} 篇文章正文...")
 
-        print(f"\n📖 通过 Chrome 提取 {len(articles)} 篇文章正文...")
+        # Chrome 后端需要确保浏览器在运行
+        if actual_backend == "chrome":
+            chrome_check = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to (name of processes) contains "Google Chrome"'],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "true" not in chrome_check.stdout.lower():
+                print("\n🚀 启动 Google Chrome...")
+                subprocess.run(["open", "-a", "Google Chrome"], timeout=10)
+                time.sleep(3)
+
         for i, article in enumerate(articles):
             print(f"\n  [{i+1}/{len(articles)}] {article['title'][:60]}...")
-            result = extract_via_chrome(article["url"])
+            result = extract_article(article["url"], backend=actual_backend)
             if result:
                 article.update({
                     "title": result["title"] or article.get("title", ""),

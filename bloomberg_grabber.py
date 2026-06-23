@@ -438,15 +438,16 @@ def send_email(
     smtp_user: str = "",
     smtp_pass: str = "",
 ) -> bool:
-    """发送 HTML 邮件。"""
+    """发送 HTML 邮件。优先 SMTP，否则通过 aio.home 的 Postfix 投递。"""
     msg = email.mime.multipart.MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = smtp_user or "bloomberg-grabber@localhost"
+    msg["From"] = smtp_user or "bloomberg@aio.home"
     msg["To"] = to_addr
     msg.attach(email.mime.text.MIMEText(plain_body, "plain", "utf-8"))
     msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
 
     if smtp_host and smtp_user and smtp_pass:
+        # 外部 SMTP（QQ 邮箱等）
         try:
             ctx = ssl.create_default_context()
             with smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx, timeout=30) as server:
@@ -457,23 +458,37 @@ def send_email(
         except Exception as e:
             print(f"  ❌ SMTP 发送失败: {e}", file=sys.stderr)
             return False
-    else:
-        # macOS sendmail fallback
-        try:
-            proc = subprocess.run(
-                ["/usr/sbin/sendmail", "-t"],
-                input=msg.as_string(),
-                capture_output=True, text=True, timeout=30,
-            )
-            if proc.returncode == 0:
-                print(f"  ✅ 邮件已通过 sendmail 发送到 {to_addr}")
-                return True
-            else:
-                print(f"  ❌ sendmail 失败 (exit {proc.returncode}): {proc.stderr[:200]}", file=sys.stderr)
-                return False
-        except Exception as e:
-            print(f"  ❌ sendmail 异常: {e}", file=sys.stderr)
+
+    # 通过 aio.home 的 Postfix 投递（家用 IP 直连 MX 会被拒，aio 有合法域名）
+    try:
+        payload = msg.as_string()
+        proc = subprocess.run(
+            ["ssh", "aio", "/usr/sbin/sendmail", "-t"],
+            input=payload, capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            print(f"  ✅ 邮件已通过 aio.home 投递到 {to_addr}")
+            return True
+        else:
+            print(f"  ❌ aio sendmail 失败: {proc.stderr[:200]}", file=sys.stderr)
+    except Exception as e:
+        print(f"  ❌ aio sendmail 异常: {e}", file=sys.stderr)
+
+    # 本机 sendmail fallback
+    try:
+        proc = subprocess.run(
+            ["/usr/sbin/sendmail", "-t"],
+            input=msg.as_string(), capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            print(f"  ✅ 邮件已通过本机 sendmail 投递到 {to_addr}")
+            return True
+        else:
+            print(f"  ❌ sendmail 失败 (exit {proc.returncode}): {proc.stderr[:200]}", file=sys.stderr)
             return False
+    except Exception as e:
+        print(f"  ❌ sendmail 异常: {e}", file=sys.stderr)
+        return False
 
 
 # ─────────────────────────────────────────────

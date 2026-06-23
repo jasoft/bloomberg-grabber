@@ -900,7 +900,14 @@ def main():
 
         for i, article in enumerate(articles):
             print(f"\n  [{i+1}/{len(articles)}] {article['title'][:60]}...")
-            result = extract_article(article["url"], backend=actual_backend)
+            result = None
+            for attempt in range(3):
+                result = extract_article(article["url"], backend=actual_backend)
+                if result:
+                    break
+                if attempt < 2:
+                    print(f"          ⚠️  重试 ({attempt+2}/3)...")
+                    time.sleep(3)
             if result:
                 article.update({
                     "title": result["title"] or article.get("title", ""),
@@ -915,7 +922,7 @@ def main():
                 article.setdefault("body_nodes", [])
                 article.setdefault("byline", "")
                 article.setdefault("ai_summary", "")
-                print(f"          ⚠️  失败，跳过正文")
+                print(f"          ❌ 3 次尝试均失败，跳过正文")
 
             if i < len(articles) - 1:
                 time.sleep(2)

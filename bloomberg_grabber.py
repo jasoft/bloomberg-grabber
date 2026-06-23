@@ -13,7 +13,7 @@ Bloomberg Headline Grabber
 
 使用方法：
   python3 bloomberg_grabber.py --count 5
-  python3 bloomberg_grabber.py --to 1188540@qq.com --count 5
+  python3 bloomberg_grabber.py --to your@email.com --count 5
   python3 bloomberg_grabber.py --count 3 --dry-run
   python3 bloomberg_grabber.py --skip-extract --count 10
 
@@ -39,6 +39,16 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+from pathlib import Path
+
+# 加载 .env 文件
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 # ─────────────────────────────────────────────
 # Constants
@@ -49,7 +59,7 @@ NS = {
     "news": "http://www.google.com/schemas/sitemap-news/0.9",
     "image": "http://www.google.com/schemas/sitemap-image/1.1",
 }
-DEFAULT_TO = "1188540@qq.com"
+DEFAULT_TO = os.getenv("BLOOMBERG_TO", "")
 BLOOMBERG_HOME = "https://www.bloomberg.com"
 LIGHTPANDA_TIMEOUT = 25  # seconds for lightpanda fetch
 # 首页模块优先级：lede 是头版头条，well-* 是次级头条区
@@ -781,7 +791,7 @@ def send_email(
     """发送 HTML 邮件。优先 SMTP，否则通过 aio.home 的 Postfix 投递。"""
     msg = email.mime.multipart.MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = smtp_user or "bloomberg@aio.home"
+    msg["From"] = smtp_user or os.getenv("BLOOMBERG_FROM", "bloomberg@localhost")
     msg["To"] = to_addr
     msg.attach(email.mime.text.MIMEText(plain_body, "plain", "utf-8"))
     msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
@@ -803,7 +813,7 @@ def send_email(
     try:
         payload = msg.as_string()
         proc = subprocess.run(
-            ["ssh", "aio", "/usr/sbin/sendmail", "-t"],
+            ["ssh", os.environ["BLOOMBERG_MAIL_HOST"], "/usr/sbin/sendmail", "-t"],
             input=payload, capture_output=True, text=True, timeout=30,
         )
         if proc.returncode == 0:

@@ -86,22 +86,40 @@ def _fetch_headlines_from_homepage(count: int) -> list[dict]:
         "document.getElementById('__NEXT_DATA__').textContent.length > 100000"
     )
 
-    result = subprocess.run(
-        [
-            "lightpanda", "fetch", BLOOMBERG_HOME,
-            "--dump", "html",
-            "--wait-ms", str(LIGHTPANDA_TIMEOUT * 1000),
-            "--wait-script", wait_expr,
-            "--json",
-            "--log-level", "error",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=LIGHTPANDA_TIMEOUT + 10,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"lightpanda exit {result.returncode}")
+    for attempt in range(2):
+        result = subprocess.run(
+            [
+                "lightpanda", "fetch", BLOOMBERG_HOME,
+                "--dump", "html",
+                "--wait-ms", str(LIGHTPANDA_TIMEOUT * 1000),
+                "--wait-script", wait_expr,
+                "--json",
+                "--log-level", "error",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=LIGHTPANDA_TIMEOUT + 10,
+        )
+        if result.returncode == 0:
+            # 验证输出包含 content
+            has_content = False
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        obj = json.loads(line)
+                        if "content" in obj:
+                            has_content = True
+                            break
+                    except json.JSONDecodeError:
+                        continue
+            if has_content:
+                break
+        if attempt == 0:
+            print(f"  ⚠️  首页抓取重试中...")
+            time.sleep(2)
+    else:
+        raise RuntimeError(f"lightpanda exit {result.returncode}, no content")
 
     # 解析 JSON 输出
     html_content = ""
@@ -481,27 +499,31 @@ def extract_article(url: str, backend: str = "auto") -> Optional[dict]:
 _TRANSLATE_CACHE: dict[str, str] = {}
 
 
-def translate_text(text: str, src: str = "en", tgt: str = "zh-CN") -> str:
-    """翻译文本。使用 Google Translate 免费端点，带缓存。"""
+def translate_text(text: str, src: str = "auto", tgt: str = "zh-CN") -> str:
+    """翻译文本。使用 Google Translate 免费端点，自动检测源语言，带缓存。"""
     if not text or not text.strip():
         return text
     cache_key = f"{src}:{tgt}:{text}"
     if cache_key in _TRANSLATE_CACHE:
         return _TRANSLATE_CACHE[cache_key]
-    try:
-        resp = requests.get(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = "".join(seg[0] for seg in data[0])
-        _TRANSLATE_CACHE[cache_key] = result
-        return result
-    except Exception as e:
-        print(f"    ⚠️  翻译失败: {e}", file=sys.stderr)
-        return text
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            result = "".join(seg[0] for seg in data[0])
+            _TRANSLATE_CACHE[cache_key] = result
+            return result
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            print(f"    ⚠️  翻译失败: {e}", file=sys.stderr)
+            return text
 
 
 def _fix_image_url(url: str) -> str:

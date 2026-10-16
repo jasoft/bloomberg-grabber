@@ -13,8 +13,8 @@
 ## 安装
 
 ```bash
-# Python 依赖
-pip3 install requests
+# Python 运行环境（依赖由 uv 自动隔离安装）
+brew install uv
 
 # Lightpanda headless 浏览器
 brew install lightpanda-io/browser/lightpanda
@@ -42,38 +42,41 @@ cp .env.example .env
 
 ```bash
 # 抓取前 5 条头条并发送到默认邮箱
-python3 bloomberg_grabber.py
+uv run --script bloomberg_grabber.py
 
 # 抓取 10 条
-python3 bloomberg_grabber.py --count 10
+uv run --script bloomberg_grabber.py --count 10
 
 # 指定收件人
-python3 bloomberg_grabber.py --to someone@example.com
+uv run --script bloomberg_grabber.py --to someone@example.com
 
 # 只预览不发邮件
-python3 bloomberg_grabber.py --count 3 --dry-run
+uv run --script bloomberg_grabber.py --count 3 --dry-run
 
 # 只获取标题列表（不提取正文）
-python3 bloomberg_grabber.py --skip-extract --count 20
+uv run --script bloomberg_grabber.py --skip-extract --count 20
 
 # 保存 HTML 到文件
-python3 bloomberg_grabber.py --count 3 --output headlines.html
+uv run --script bloomberg_grabber.py --count 3 --output headlines.html
 
 # 抓取指定文章
-python3 bloomberg_grabber.py --url https://www.bloomberg.com/news/articles/...
+uv run --script bloomberg_grabber.py --url https://www.bloomberg.com/news/articles/...
 ```
 
 ## 定时执行
 
 ```bash
 # 每天早上 9 点抓取 5 条头条发到邮箱
-0 9 * * * cd /path/to/bloomberg-grabber && python3 bloomberg_grabber.py --count 5
+0 9 * * * cd /path/to/bloomberg-grabber && /opt/homebrew/bin/uv run --script bloomberg_grabber.py --count 5
 ```
+
+macOS LaunchAgent 同样使用 `/opt/homebrew/bin/uv run --script /绝对路径/bloomberg_grabber.py --count 5`。
+不要直接调用 Homebrew 的 `python3`：升级 Python 后，全局安装的依赖可能不再可用。
 
 ## 依赖
 
 - Python 3.9+
-- `requests`
+- `uv`（根据脚本声明自动安装 `requests`）
 - [Lightpanda](https://github.com/lightpanda-io/browser)
 
 ## License
